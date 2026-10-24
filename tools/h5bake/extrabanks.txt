@@ -1,0 +1,49 @@
+
+// ---- extra campaign banks ----------------------------------------------------------------------------
+// halo5onpc's campaign package holds the banks its converted tags reference. Forge's own (native) tags in a mission
+// also request Guardians banks Forge never shipped (e.g. sb_001_vo_ai_global: Covenant AI dialogue, Grunt/Elite
+// chatter), so those played silent. Every Guardians bank that no Forge package and no campaign package carries is
+// converted with halo5onpc's AudioConverter (same recipes; banks without a recipe are reported and skipped) and
+// written as one more AKPK (soundvoice's language table: sfx 0, english(us) 1) for MergeAudio to fold in.
+static string? BuildExtraBanks(string vanillaSound, string forgeSound, string campaignPck, string output)
+{
+    static uint U(byte[] b, int o) => BinaryPrimitives.ReadUInt32LittleEndian(b.AsSpan(o));
+    static (byte[] Lang, List<(uint Id, uint Block, uint Size, uint Start, uint Lang)> Banks, HashSet<uint> Media) Read(string path)
+    {
+        using var s = File.OpenRead(path); var h = new byte[28]; s.ReadExactly(h);
+        var t = new byte[checked((int)U(h, 4) + 8)]; s.Position = 0; s.ReadExactly(t);
+        int lm = (int)U(t, 12), bl = (int)U(t, 16); var banks = new List<(uint, uint, uint, uint, uint)>(); var media = new HashSet<uint>();
+        int at = 28 + lm; var n = U(t, at); for (var i = 0; i < n; i++) { var o = at + 4 + i * 20; banks.Add((U(t, o), U(t, o + 4), U(t, o + 8), U(t, o + 12), U(t, o + 16))); }
+        at = 28 + lm + bl; n = U(t, at); for (var i = 0; i < n; i++) media.Add(U(t, at + 4 + i * 20));
+        return (t.AsSpan(28, lm).ToArray(), banks, media);
+    }
+    var have = new HashSet<uint>();
+    foreach (var dir in new[] { "SFX", "English(US)" })
+        foreach (var p in Directory.GetFiles(Path.Combine(forgeSound, dir), "*.pck")) foreach (var e in Read(p).Banks) have.Add(e.Id);
+    var campaign = Read(campaignPck); foreach (var e in campaign.Banks) have.Add(e.Id);
+    var converter = new AudioConverter(); var written = new List<(uint Id, uint Lang, byte[] Bytes)>(); var skipped = new List<uint>();
+    foreach (var (pkg, lang) in new[] { (Path.Combine(vanillaSound, "SFX", "soundbank.pck"), 0u), (Path.Combine(vanillaSound, "English(US)", "soundvoice.pck"), 1u) })
+    {
+        var src = Read(pkg); using var s = File.OpenRead(pkg);
+        foreach (var e in src.Banks.Where(b => !have.Contains(b.Id)))
+        {
+            var raw = new byte[e.Size]; s.Position = (long)e.Start * e.Block; s.ReadExactly(raw);
+            try { written.Add((e.Id, lang, converter.Bank(raw, e.Id).Bytes)); have.Add(e.Id); }
+            catch (Exception ex) { skipped.Add(e.Id); Console.WriteLine($"extra bank {e.Id}: not converted ({ex.Message})"); }
+        }
+    }
+    if (written.Count == 0) { Console.WriteLine("extra banks: none needed"); return null; }
+    written.Sort((x, y) => x.Id != y.Id ? x.Id.CompareTo(y.Id) : x.Lang.CompareTo(y.Lang));
+    var lang = campaign.Lang; var headerLength = 28 + lang.Length + 4 + 20 * written.Count + 4 + 4;
+    var path = Path.Combine(output, "h5campaign", "extra-banks.pck"); if (File.Exists(path)) File.Delete(path);
+    using (var o = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
+    {
+        var h = new byte[headerLength]; "AKPK"u8.CopyTo(h); void W(int at, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(at), v);
+        W(4, (uint)headerLength - 8); W(8, 1); W(12, (uint)lang.Length); W(16, (uint)(4 + 20 * written.Count)); W(20, 4); W(24, 4); lang.CopyTo(h, 28);
+        long pos = (headerLength + 4095) / 4096 * 4096; var c = 28 + lang.Length; W(c, (uint)written.Count); c += 4;
+        foreach (var (id, l, bytes) in written) { W(c, id); W(c + 4, 4096); W(c + 8, (uint)bytes.Length); W(c + 12, checked((uint)(pos / 4096))); W(c + 16, l); c += 20; o.Position = pos; o.Write(bytes); pos = (pos + bytes.Length + 4095) / 4096 * 4096; }
+        W(c, 0); c += 4; W(c, 0); o.Position = 0; o.Write(h);
+    }
+    Console.WriteLine($"extra banks: {written.Count} converted into {path}, {skipped.Count} without a conversion rule");
+    return path;
+}

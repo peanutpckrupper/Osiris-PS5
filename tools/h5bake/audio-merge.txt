@@ -1,0 +1,57 @@
+
+// ---- campaign audio: one package Forge already loads ------------------------------------------------
+// Forge loads a fixed set of Wwise packages from sound\win (soundbank, soundstream, soundvoice, ...); halo5onpc
+// registered sound\win\h5solo-campaign.pck in memory after startup. Its prepared package holds only banks/media
+// that Forge's soundbank/soundstream/soundvoice lack, and it was written with soundvoice's language table, so
+// here it is merged into <language>\soundvoice.pck: one AKPK with both lookup tables (sorted by id, language) and
+// both payload sets, 4 KiB-block aligned. Written next to the target and moved over it, so the hard link to the
+// vanilla Forge file is replaced, never written through.
+static void MergeAudio(string nativePck, string campaignPck, string target)
+{
+    static uint U(byte[] b, int o) => BinaryPrimitives.ReadUInt32LittleEndian(b.AsSpan(o));
+    static byte[] Tables(FileStream s) { var h = new byte[28]; s.Position = 0; s.ReadExactly(h); if (!h.AsSpan(0, 4).SequenceEqual("AKPK"u8) || U(h, 8) != 1) throw new InvalidDataException("not an AKPK v1 package");
+        var t = new byte[checked((int)U(h, 4) + 8)]; s.Position = 0; s.ReadExactly(t); if (t.Length != 28 + U(t, 12) + U(t, 16) + U(t, 20) + U(t, 24)) throw new InvalidDataException("AKPK table sizes disagree"); return t; }
+    static List<(uint Id, uint Block, uint Size, uint Start, uint Lang, int Src)> Lut(byte[] t, int at, int src)
+    { var n = U(t, at); var list = new List<(uint, uint, uint, uint, uint, int)>(); for (var i = 0; i < n; i++) { var o = at + 4 + i * 20; list.Add((U(t, o), U(t, o + 4), U(t, o + 8), U(t, o + 12), U(t, o + 16), src)); } return list; }
+    var stamp = target + ".h5merge"; var nativeInfo = new FileInfo(nativePck); var campaignInfo = new FileInfo(campaignPck);
+    var expected = $"{nativeInfo.Length} {nativeInfo.LastWriteTimeUtc.Ticks} {campaignInfo.Length} {campaignInfo.LastWriteTimeUtc.Ticks}";
+    if (File.Exists(stamp) && File.Exists(target) && File.ReadAllText(stamp).Split('\n')[0] == expected && new FileInfo(target).Length.ToString() == File.ReadAllText(stamp).Split('\n').ElementAtOrDefault(1))
+    { Console.WriteLine($"audio: {target} already merged"); return; }
+    using var a = File.OpenRead(nativePck); using var b = File.OpenRead(campaignPck);
+    var ta = Tables(a); var tb = Tables(b);
+    int langA = (int)U(ta, 12), langB = (int)U(tb, 12);
+    if (!ta.AsSpan(28, langA).SequenceEqual(tb.AsSpan(28, langB))) throw new InvalidDataException("campaign audio was prepared for another language table");
+    if (U(ta, 24) != 4 || U(tb, 24) != 4) throw new InvalidDataException("external-source tables are not supported");
+    var banks = Lut(ta, 28 + langA, 0); var media = Lut(ta, 28 + langA + (int)U(ta, 16), 0);
+    var seenB = banks.Select(x => (x.Id, x.Lang)).ToHashSet(); var seenM = media.Select(x => (x.Id, x.Lang)).ToHashSet(); int dup = 0;
+    foreach (var e in Lut(tb, 28 + langB, 1)) if (seenB.Add((e.Id, e.Lang))) banks.Add(e); else dup++;
+    foreach (var e in Lut(tb, 28 + langB + (int)U(tb, 16), 1)) if (seenM.Add((e.Id, e.Lang))) media.Add(e); else dup++;
+    banks.Sort((x, y) => x.Id != y.Id ? x.Id.CompareTo(y.Id) : x.Lang.CompareTo(y.Lang)); media.Sort((x, y) => x.Id != y.Id ? x.Id.CompareTo(y.Id) : x.Lang.CompareTo(y.Lang));
+    var headerLength = 28 + langA + 4 + 20 * banks.Count + 4 + 20 * media.Count + 4;
+    var temp = target + ".h5tmp"; if (File.Exists(temp)) File.Delete(temp);
+    var placed = new Dictionary<(int Src, uint Id, uint Lang, bool Bank), uint>();
+    using (var o = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 20))
+    {
+        long pos = (headerLength + 4095) / 4096 * 4096; var buffer = new byte[1 << 20];
+        foreach (var (list, isBank) in new[] { (banks, true), (media, false) })
+            foreach (var e in list.OrderBy(x => x.Src).ThenBy(x => (long)x.Start * x.Block))
+            {
+                if (e.Block != 4096) throw new InvalidDataException("unexpected block size " + e.Block);
+                pos = (pos + 4095) / 4096 * 4096; placed[(e.Src, e.Id, e.Lang, isBank)] = checked((uint)(pos / 4096));
+                var src = e.Src == 0 ? a : b; src.Position = (long)e.Start * e.Block; o.Position = pos;
+                for (long left = e.Size; left > 0;) { var n = (int)Math.Min(buffer.Length, left); src.ReadExactly(buffer, 0, n); o.Write(buffer, 0, n); left -= n; }
+                pos += e.Size;
+            }
+        o.SetLength(Math.Max(o.Length, pos));
+        var h = new byte[headerLength]; "AKPK"u8.CopyTo(h);
+        void W(int at, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(at), v);
+        W(4, (uint)headerLength - 8); W(8, 1); W(12, (uint)langA); W(16, (uint)(4 + 20 * banks.Count)); W(20, (uint)(4 + 20 * media.Count)); W(24, 4);
+        ta.AsSpan(28, langA).CopyTo(h.AsSpan(28)); var c = 28 + langA;
+        foreach (var (list, isBank) in new[] { (banks, true), (media, false) })
+        { W(c, (uint)list.Count); c += 4; foreach (var e in list) { W(c, e.Id); W(c + 4, e.Block); W(c + 8, e.Size); W(c + 12, placed[(e.Src, e.Id, e.Lang, isBank)]); W(c + 16, e.Lang); c += 20; } }
+        W(c, 0); o.Position = 0; o.Write(h);
+    }
+    File.Move(temp, target, overwrite: true);
+    File.WriteAllText(stamp, expected + "\n" + new FileInfo(target).Length);
+    Console.WriteLine($"audio: merged campaign package into {target}: {banks.Count} banks, {media.Count} media ({dup} duplicates kept native), {new FileInfo(target).Length} bytes");
+}

@@ -1,0 +1,15 @@
+# build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+# release artifacts / staging
+Release/
+Package/
+*.zip
+# never commit game files or tokens
+*.module
+*.tag
+shim-tokens*.txt
+forge-profile/

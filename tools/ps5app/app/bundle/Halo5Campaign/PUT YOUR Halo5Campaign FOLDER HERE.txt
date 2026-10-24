@@ -1,0 +1,2 @@
+Copy the contents of your Halo5Campaign folder here (the folder OsirisSetup.exe made on your PC),
+so that this folder has Osiris.exe, halo5forge.exe, deploy, sound, h5campaign and the rest in it.
